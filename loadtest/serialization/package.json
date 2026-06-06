@@ -1,0 +1,8 @@
+{
+  "name": "manifold-loadlab",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "CPU-limited load harness reproducing Manifold bet-path serialization under concurrency",
+  "dependencies": { "pg": "^8.13.1" }
+}

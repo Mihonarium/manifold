@@ -7,6 +7,11 @@ import {
   updateMakers,
 } from 'api/helpers/bets'
 import { onCreateBets } from 'api/on-create-bet'
+import {
+  canParallelizeAnswer,
+  getPoolDepToken,
+} from 'api/helpers/answer-bet-parallelism'
+import { bufferContractAggregate } from 'api/helpers/contract-aggregate-buffer'
 import { Answer } from 'common/answer'
 import { ValidatedAPIParams } from 'common/api/schema'
 import { Bet, getNewBetId, LimitBet, maker } from 'common/bet'
@@ -73,8 +78,10 @@ export const placeBet: APIHandler<'bet'> = async (props, auth) => {
     return queueDependenciesThenBet(props, auth, isApi)
   }
 
-  // Worst thing that could happen from wrong deps is contention
-  const fullDeps = [auth.uid, contractId, ...(deps ?? [])]
+  // Worst thing that could happen from wrong deps is contention.
+  // Independent answers of a multi market key per-pool so they run in parallel.
+  const poolToken = getPoolDepToken(contractId, props.answerId)
+  const fullDeps = [auth.uid, poolToken, ...(deps ?? [])]
   return await betsQueue.enqueueFn(() => {
     return placeBetMain(props, auth.uid, isApi)
   }, fullDeps)
@@ -86,7 +93,7 @@ const queueDependenciesThenBet = async (
   isApi: boolean
 ) => {
   const { dryRun, contractId } = props
-  const minimalDeps = [auth.uid, contractId]
+  const minimalDeps = [auth.uid, getPoolDepToken(contractId, props.answerId)]
   return await ordersQueue.enqueueFn(async () => {
     const { contract, answers, unfilledBets, balanceByUserId } =
       await fetchContractBetDataAndValidate(
@@ -605,7 +612,15 @@ export const executeNewBetResult = async (
   })
   const metricsQuery = bulkUpdateContractMetricsQuery(newMetrics)
   const streakIncrementedQuery = incrementStreakQuery(user, newBet.createdTime)
-  const contractUpdateQuery = updateDataQuery('contracts', 'id', contractUpdate)
+  // For independent (non-sum-to-one) multi answers, keep the shared contract row
+  // OUT of this serializable transaction so concurrent answers touch only disjoint
+  // rows. Its eventually-consistent aggregates are applied via the deferred buffer
+  // below. Gated on !isMultiBet so the multi-answer-at-once path is never affected.
+  const deferContractAgg =
+    !isMultiBet && canParallelizeAnswer(contract.id, newBet.answerId)
+  const contractUpdateQuery = deferContractAgg
+    ? 'select 1 where false'
+    : updateDataQuery('contracts', 'id', contractUpdate)
   const answerUpdateQuery = bulkUpdateQuery(
     'answers',
     ['id'],
@@ -628,6 +643,15 @@ export const executeNewBetResult = async (
      `
   )
   log(`placeBet bulk insert/update took ${Date.now() - startTime}ms`)
+  if (deferContractAgg) {
+    // Apply the contract-row aggregates out of band (atomic, recomputable).
+    bufferContractAggregate(contract.id, {
+      volume: sumBy(betsToInsert, (b) => Math.abs(b.amount)),
+      uniqueBettors: isUniqueBettor ? 1 : 0,
+      lastBetTime,
+      answersChanged: answerUpdates.length > 0,
+    })
+  }
   const userUpdates = results[0] as UserUpdate[]
   if (userUpdates.length) {
     // if negative balances, make sure the balance is higher than when they started
